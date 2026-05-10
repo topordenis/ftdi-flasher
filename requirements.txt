@@ -1,0 +1,7 @@
+# One of these is required at runtime:
+#   pyserial   — Windows-friendly (uses the FTDI VCP driver, no driver swap)
+#   pyftdi     — macOS / Linux (uses libusb directly)
+# The flasher auto-picks based on platform; both can also be installed.
+
+pyserial>=3.5
+pyftdi>=0.55.0

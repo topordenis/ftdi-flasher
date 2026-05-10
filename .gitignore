@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output dumps from running the tool (keep proprietary firmware out of repo).
+# We DO ship stub/stub.bin (the assembled SH-2 stub) — that's source-equivalent.
+ecu_dump*.bin
+sagem_dump*.bin
+my_*.bin
+my_ecu*.bin
+
+# Proprietary calibration files (Renault A2L, vendor hex dumps)
+*.A2L
+*.a2l
+*.hex
+*.frf
+*.s19
+
+# IDA / Ghidra working files
+*.i64
+*.id0
+*.id1
+*.idb
+*.nam
+*.til
+*.gar
+*.gpr
+ghidra_projects/
