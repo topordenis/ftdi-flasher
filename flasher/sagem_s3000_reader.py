@@ -218,9 +218,15 @@ def auto_pick_transport(prefer: str = "auto"):
 # --------------------------------------------------------------------------
 
 class KWP2000:
-    """KWP2000 (ISO 14230) frame helpers. Uses the addressed long-format header
-    `[80][tgt][src][len][data][cksum]` for variable-length frames, and the
-    addressed short-format `[80|len][tgt][src][data][cksum]` for short ones."""
+    """KWP2000 (ISO 14230) frame helpers. Supports two framings:
+      - addressed: `[0x80|n][tgt][src][data][cksum]` (short, n in 1..0x3F)
+                   `[0x80][tgt][src][n][data][cksum]` (long)
+      - CARB / no-address: `[n][data][cksum]` (short, n in 1..0x3F)
+                           `[0x00][n][data][cksum]` (long)
+    Galletto's captured Sagem S3000 flow uses CARB for all the programming-
+    related commands (AccessTimingParameter, WriteDataByLID, RequestDownload,
+    TransferData, StartRoutine) and addressed for session/security control
+    (StartDiagSession, SecurityAccess)."""
 
     def __init__(self, kline: KlineFTDI):
         self.kline = kline
@@ -231,8 +237,6 @@ class KWP2000:
 
     def build_frame(self, sid_and_data: bytes,
                     tgt: int = ECU_ADDR, src: int = TESTER_ADDR) -> bytes:
-        """Build a KWP frame using addressed format, picking short vs long
-        based on the data length."""
         n = len(sid_and_data)
         if n == 0:
             raise ValueError("empty frame")
@@ -240,6 +244,17 @@ class KWP2000:
             header = bytes([0x80 | n, tgt, src])
         else:
             header = bytes([0x80, tgt, src, n])
+        body = header + sid_and_data
+        return body + bytes([self.cksum(body)])
+
+    def build_frame_carb(self, sid_and_data: bytes) -> bytes:
+        n = len(sid_and_data)
+        if n == 0:
+            raise ValueError("empty frame")
+        if n <= 0x3F:
+            header = bytes([n])
+        else:
+            header = bytes([0x00, n])
         body = header + sid_and_data
         return body + bytes([self.cksum(body)])
 
@@ -302,27 +317,40 @@ class KWP2000:
 
             return data  # SID + payload
 
+    def _validate_response(self, response: bytes, sid_sent: int):
+        if response[0] == 0x7F:
+            nrc = response[2] if len(response) >= 3 else 0
+            raise RuntimeError(
+                f"KWP NRC: SID=0x{response[1]:02X} code=0x{nrc:02X}"
+            )
+        sid_echo = response[0]
+        if sid_echo != (sid_sent | 0x40):
+            raise RuntimeError(
+                f"unexpected response SID: got 0x{sid_echo:02X}, want 0x{sid_sent | 0x40:02X}"
+            )
+
     def request(self, sid_and_data: bytes,
                 tgt: int = ECU_ADDR, src: int = TESTER_ADDR,
                 expect_positive: bool = True) -> bytes:
-        """Send a request, read response, validate.
+        """Send an addressed-format request, read response, validate.
         Returns the response data (SID byte + payload).
         If `expect_positive=True`, raises on a negative response (`7F xx yy`)."""
         frame = self.build_frame(sid_and_data, tgt, src)
         self.send_raw(frame)
         response = self.recv_response()
         if expect_positive:
-            if response[0] == 0x7F:
-                nrc = response[2] if len(response) >= 3 else 0
-                raise RuntimeError(
-                    f"KWP NRC: SID=0x{response[1]:02X} code=0x{nrc:02X}"
-                )
-            sid_echo = response[0]
-            sid_sent = sid_and_data[0]
-            if sid_echo != (sid_sent | 0x40):
-                raise RuntimeError(
-                    f"unexpected response SID: got 0x{sid_echo:02X}, want 0x{sid_sent | 0x40:02X}"
-                )
+            self._validate_response(response, sid_and_data[0])
+        return response
+
+    def request_carb(self, sid_and_data: bytes,
+                     expect_positive: bool = True) -> bytes:
+        """Send a CARB-format (no-address) request, read response, validate.
+        Used for the Galletto-style programming commands."""
+        frame = self.build_frame_carb(sid_and_data)
+        self.send_raw(frame)
+        response = self.recv_response()
+        if expect_positive:
+            self._validate_response(response, sid_and_data[0])
         return response
 
 
@@ -366,14 +394,11 @@ class SagemS3000:
         return self.kwp.request(body)
 
     def change_speed_to_125k(self):
-        # First: AccessTimingParameter setTiming
-        # 07 83 03 02 50 14 14 00 (data part - SID + params)
-        # Galletto sends `07 83 03 02 50 14 14 00 ??` as a CARB-mode short frame.
-        # Equivalent here is the raw byte sequence. We use addressed long-format,
-        # which is functionally equivalent.
-        self.kwp.request(bytes([0x83, 0x03, 0x02, 0x50, 0x14, 0x14, 0x00]))
-        # Then: StartDiagSession sub=0x85 with param 0x87 — this signals the ECU
-        # to switch its UART to 125000 baud once the response is sent.
+        # AccessTimingParameter setTimingParameters — Galletto sends this in
+        # CARB form: `07 83 03 02 50 14 14 00 ??`
+        self.kwp.request_carb(bytes([0x83, 0x03, 0x02, 0x50, 0x14, 0x14, 0x00]))
+        # StartDiagSession sub=0x85 with param 0x87 — addressed form, signals
+        # the ECU to switch its UART to 125000 baud once the response is sent.
         self.kwp.request(bytes([0x10, 0x85, 0x87]))
         time.sleep(0.020)
         # Switch our side to 125000 baud
@@ -399,49 +424,50 @@ class SagemS3000:
     # ---- step 4: misc setup steps Galletto does ---------------------
 
     def write_marker_records(self):
-        """Galletto writes two LID records before the bootloader upload.
-        We replicate them to match exactly."""
-        # WriteDataByLocalIdentifier 0x98 with 10 ASCII spaces
-        self.kwp.request(bytes([0x3B, 0x98]) + b" " * 10)
-        # WriteDataByLocalIdentifier 0x99 with 4 fixed bytes
-        self.kwp.request(bytes([0x3B, 0x99, 0x20, 0x03, 0x04, 0x02]))
+        """Galletto writes two LID records before the bootloader upload, both
+        in CARB form. We replicate them to match exactly."""
+        # `0C 3B 98 [10 spaces] ??`
+        self.kwp.request_carb(bytes([0x3B, 0x98]) + b" " * 10)
+        # `06 3B 99 20 03 04 02 ??`
+        self.kwp.request_carb(bytes([0x3B, 0x99, 0x20, 0x03, 0x04, 0x02]))
 
     # ---- step 5: upload our SH-2 stub -------------------------------
 
     def upload_stub(self, stub_bytes: bytes, ram_addr: int = STUB_RAM_ADDR):
-        """SID 0x34 RequestDownload + SID 0x36 TransferData.
-        We send our small stub in one chunk."""
-        if len(stub_bytes) > 0x1000:
-            raise ValueError("stub too large for one TransferData chunk")
-        # RequestDownload: addr (3 bytes) + format (1 byte) + size (3 bytes)
+        """SID 0x34 RequestDownload + SID 0x36 TransferData, both in CARB form
+        to match Galletto exactly. RequestDownload declares the bootloader's
+        fixed 0x420-byte upload window (not our actual stub size); the
+        bootloader then accepts however many bytes we send via TransferData."""
+        if len(stub_bytes) > 0x420:
+            raise ValueError(
+                f"stub ({len(stub_bytes)} bytes) exceeds Galletto's 0x420 upload window"
+            )
+
+        # `08 34 40 E0 00 00 00 04 20 ??` — RequestDownload, addr 0x40E000,
+        # format 0x00, size 0x000420 (Galletto's fixed window).
+        declared_size = 0x420
         rd = bytes([
             0x34,
             (ram_addr >> 16) & 0xFF, (ram_addr >> 8) & 0xFF, ram_addr & 0xFF,
-            0x00,  # format byte
-            (len(stub_bytes) >> 16) & 0xFF, (len(stub_bytes) >> 8) & 0xFF, len(stub_bytes) & 0xFF,
+            0x00,
+            (declared_size >> 16) & 0xFF, (declared_size >> 8) & 0xFF, declared_size & 0xFF,
         ])
-        self.kwp.request(rd)
-        # TransferData: SID 0x36 + raw chunk bytes
-        # Galletto uses no-address long-format here: [00][len][36][data][cksum]
-        # We approximate by sending the equivalent in addressed long format.
+        self.kwp.request_carb(rd)
+
+        # `00 LL 36 [data] ??` — TransferData in CARB long form.
         td_body = bytes([0x36]) + stub_bytes
-        # Build with the 0x80 long header; len = 1 (SID) + len(stub_bytes)
-        n = len(td_body)
-        header = bytes([0x80, ECU_ADDR, TESTER_ADDR, n])
-        frame = header + td_body
-        frame += bytes([self.kwp.cksum(frame)])
+        frame = self.kwp.build_frame_carb(td_body)
         self.kline.write(frame)
-        # Drain echo
         self.kline.read(len(frame), timeout_s=0.5)
-        # Read response
         resp = self.kwp.recv_response(timeout_s=2.0)
         if resp[0] == 0x7F:
             nrc = resp[2] if len(resp) >= 3 else 0
             raise RuntimeError(f"TransferData NRC: 0x{nrc:02X}")
 
     def start_routine(self):
-        """SID 0x31 StartRoutineByLocalIdentifier with the params Galletto uses."""
-        self.kwp.request(bytes([0x31, 0x02, 0x20, 0x00, 0x00, 0x0F, 0xBF, 0xFF]))
+        """SID 0x31 StartRoutineByLocalIdentifier with the params Galletto uses.
+        Galletto sends this in CARB form: `08 31 02 20 00 00 0F BF FF ??`."""
+        self.kwp.request_carb(bytes([0x31, 0x02, 0x20, 0x00, 0x00, 0x0F, 0xBF, 0xFF]))
 
     # ---- ID-only flow ------------------------------------------------
 
@@ -613,7 +639,8 @@ def run(start: int, end: int, out_path: Path, stub_path: Path,
         print("[4/8] SecurityAccess (seed -> key)...")
         sagem.security_access()
         print("[5/8] AccessTimingParameter (final)...")
-        sagem.kwp.request(bytes([0x83, 0x03, 0x00, 0xC8, 0x02, 0x78, 0x00]))
+        # Galletto sends this in CARB form: `07 83 03 00 C8 02 78 00 ??`
+        sagem.kwp.request_carb(bytes([0x83, 0x03, 0x00, 0xC8, 0x02, 0x78, 0x00]))
         print("[6/8] write marker records...")
         sagem.write_marker_records()
         print(f"[7/8] uploading stub ({len(stub_bytes)} bytes) to RAM 0x{STUB_RAM_ADDR:X}...")
